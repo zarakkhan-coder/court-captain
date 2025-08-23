@@ -1,20 +1,19 @@
-# CourtCaptain — Votes + Names, 4-player rule, Weather, Manual Availability Editor, Booking Button
-# Drop-in main.py for Render (or any host). No scraping required.
+# CourtCaptain — Votes + Names, 4-player rule, Weather, Manual Availability, Bookmarklet Importer, Booking Button
 
 from flask import Flask, request, redirect, url_for, render_template_string, flash, jsonify
 from datetime import datetime, timezone, date
-import os, sqlite3, requests
+import os, sqlite3, requests, json
 
 APP_NAME = "CourtCaptain"
 PREFERRED_COURTS = ["Court 1", "Court 2", "Court 3", "Court 4"]
 ALL_COURTS = PREFERRED_COURTS + ["Court 5", "Court 6", "Court 7", "Outdoor A", "Outdoor B", "Other"]
 DAYS = ["Saturday", "Sunday"]
 
-# --- Environment (set in Render → Environment) ---
+# --- Environment (Render → Environment) ---
 RESET_PIN   = os.environ.get("RESET_PIN", "1234")
-SECRET_KEY  = os.environ.get("SECRET_KEY", "replace-me")          # set any long random string
-BOOKING_URL = os.environ.get("BOOKING_URL", "https://wholehealth.walmart.com/")
-LAT = float(os.environ.get("WALTON_LAT", "36.372"))               # optional: exact coords
+SECRET_KEY  = os.environ.get("SECRET_KEY", "replace-me")
+BOOKING_URL = os.environ.get("BOOKING_URL", "https://walmart.clubautomation.com/event/reserve-court-new")
+LAT = float(os.environ.get("WALTON_LAT", "36.372"))
 LON = float(os.environ.get("WALTON_LON", "-94.208"))
 
 DB_PATH = "data.db"
@@ -31,113 +30,74 @@ def db():
 def init_db():
     conn = db()
     c = conn.cursor()
-    # Votes (one row per unique name; re-vote overwrites)
     c.execute("""CREATE TABLE IF NOT EXISTS votes(
         name  TEXT PRIMARY KEY,
         day   TEXT NOT NULL,
         court TEXT NOT NULL,
         ts    TEXT NOT NULL
     )""")
-    # Availability (one row per slot)
     c.execute("""CREATE TABLE IF NOT EXISTS availability(
-        day   TEXT NOT NULL,   -- 'Saturday' or 'Sunday'
-        court TEXT NOT NULL,   -- e.g., 'Court 1'
-        slot  TEXT NOT NULL    -- e.g., '9:00–10:00'
+        day   TEXT NOT NULL,
+        court TEXT NOT NULL,
+        slot  TEXT NOT NULL
     )""")
     conn.commit(); conn.close()
-
 init_db()
 
 # ---------- helpers ----------
 def pref_rank(court):
     return PREFERRED_COURTS.index(court) if court in PREFERRED_COURTS else 100 + ALL_COURTS.index(court)
 
-def day_rank(day):
-    return 0 if day == "Saturday" else 1
+def day_rank(day): return 0 if day == "Saturday" else 1
 
-def is_outdoor(court: str) -> bool:
-    return "outdoor" in court.lower()
+def is_outdoor(court:str)->bool: return "outdoor" in court.lower()
 
 def tally_with_names():
-    """
-    Return totals AND voter names per (day, court).
-    {
-      'total_players': int,
-      'counts': [{'day':..,'court':..,'votes':..,'names':[...]}...],
-      'top_choice': {'day':..,'court':..,'votes':..,'names':[...]} or None,
-      'booking_possible': bool
-    }
-    """
     conn = db()
     rows = conn.execute("SELECT name, day, court FROM votes").fetchall()
     conn.close()
-
     unique_players = set()
-    buckets = {}  # (day,court) -> {'votes': int, 'names': [str]}
+    buckets = {}
     for r in rows:
         nm = (r["name"] or "").strip()
-        if not nm:
-            continue
+        if not nm: continue
         unique_players.add(nm.lower())
         key = (r["day"], r["court"])
-        if key not in buckets:
-            buckets[key] = {"votes": 0, "names": []}
+        if key not in buckets: buckets[key] = {"votes":0, "names":[]}
         buckets[key]["votes"] += 1
         buckets[key]["names"].append(nm)
-
-    ranked = sorted(
-        buckets.items(),
-        key=lambda kv: (-kv[1]["votes"], pref_rank(kv[0][1]), day_rank(kv[0][0]))
-    )
+    ranked = sorted(buckets.items(), key=lambda kv:(-kv[1]["votes"], pref_rank(kv[0][1]), day_rank(kv[0][0])))
     top = None
     if ranked:
-        (d, c), info = ranked[0]
-        top = {"day": d, "court": c, "votes": info["votes"], "names": sorted(info["names"])}
-
-    counts = [{"day": d, "court": c, "votes": info["votes"], "names": sorted(info["names"])}
-              for (d, c), info in ranked]
-
-    return {
-        "total_players": len(unique_players),
-        "counts": counts,
-        "top_choice": top,
-        "booking_possible": len(unique_players) >= 4
-    }
+        (d,c), info = ranked[0]
+        top = {"day":d, "court":c, "votes":info["votes"], "names":sorted(info["names"])}
+    counts = [{"day":d, "court":c, "votes":info["votes"], "names":sorted(info["names"])} for (d,c),info in ranked]
+    return {"total_players":len(unique_players), "counts":counts, "top_choice":top, "booking_possible":len(unique_players)>=4}
 
 def fetch_weather_all():
-    """
-    Simple 7-day forecast via Open-Meteo (no API key).
-    Returns weather for Saturday and Sunday if present:
-    {'Saturday': {'tmax':..,'tmin':..,'pop':..,'date':'YYYY-MM-DD'}, 'Sunday': {...}}
-    """
     out = {}
     try:
-        url = (
-            "https://api.open-meteo.com/v1/forecast"
-            f"?latitude={LAT}&longitude={LON}"
-            "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
-            "&forecast_days=7&timezone=auto"
-        )
+        url = ("https://api.open-meteo.com/v1/forecast"
+               f"?latitude={LAT}&longitude={LON}"
+               "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+               "&forecast_days=7&timezone=auto")
         r = requests.get(url, timeout=8); r.raise_for_status()
         d = r.json().get("daily", {})
         times = d.get("time", [])
-        tmax = d.get("temperature_2m_max", [])
-        tmin = d.get("temperature_2m_min", [])
-        pop  = d.get("precipitation_probability_max", [])
+        tmax  = d.get("temperature_2m_max", [])
+        tmin  = d.get("temperature_2m_min", [])
+        pop   = d.get("precipitation_probability_max", [])
         for i, ds in enumerate(times):
-            y, m, dd = map(int, ds.split("-"))
-            wname = date(y, m, dd).strftime("%A")
-            if wname in ("Saturday", "Sunday"):
-                out[wname] = {"date": ds, "tmax": tmax[i], "tmin": tmin[i], "pop": pop[i]}
+            y,m,dd = map(int, ds.split("-"))
+            wname = date(y,m,dd).strftime("%A")
+            if wname in ("Saturday","Sunday"):
+                out[wname] = {"date":ds, "tmax":tmax[i], "tmin":tmin[i], "pop":pop[i]}
         return out
     except Exception:
-        return out  # empty on failure
+        return out
 
 def get_availability_times():
-    """
-    Manual availability from the local DB (admin-editable).
-    Returns: {'Saturday': {'Court 1':[...], ...}, 'Sunday': {...}}
-    """
+    """Return {'Saturday': {'Court 1':[...], ...}, 'Sunday': {...}} from DB."""
     result = {d: {c: [] for c in ALL_COURTS} for d in DAYS}
     conn = db()
     rows = conn.execute("SELECT day, court, slot FROM availability").fetchall()
@@ -147,13 +107,30 @@ def get_availability_times():
         if day in result and court in result[day]:
             if slot not in result[day][court]:
                 result[day][court].append(slot)
-    # Sort slots for nicer display
     for d in DAYS:
         for c in ALL_COURTS:
             result[d][c].sort()
     return result
 
-# ---------- templates (no Jinja inheritance — simple & stable) ----------
+def clear_all_availability():
+    conn = db(); conn.execute("DELETE FROM availability"); conn.commit(); conn.close()
+
+def bulk_upsert_availability(day:str, mapping:dict):
+    """
+    mapping: {'Court 1': ['9:00–10:00', ...], 'Court 2': [...], ...}
+    Clears existing rows for that day and inserts fresh.
+    """
+    if day not in DAYS: return
+    conn = db()
+    conn.execute("DELETE FROM availability WHERE day=?", (day,))
+    for court, slots in mapping.items():
+        if court not in ALL_COURTS: continue
+        for s in slots:
+            if not s: continue
+            conn.execute("INSERT INTO availability(day, court, slot) VALUES(?,?,?)", (day, court, s))
+    conn.commit(); conn.close()
+
+# ---------- templates ----------
 BASE = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -197,6 +174,7 @@ input,select{width:100%;padding:12px;border-radius:10px;border:1px solid var(--b
   <a href="{{ url_for('home') }}">Vote</a>
   <a href="{{ url_for('results') }}">Results</a>
   <a href="{{ url_for('admin_availability') }}">Admin</a>
+  <a href="{{ url_for('admin_bookmarklet') }}">Import</a>
 </div></div>
 {% with messages = get_flashed_messages(with_categories=true) %}{% for cat,msg in messages %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}{% endwith %}
 {{ content|safe }}
@@ -295,7 +273,7 @@ RESULTS = """
 </div>
 
 <div class="card">
-  <h3 style="margin-top:0">Pickleball Court Availability (Manual, Real-Time)</h3>
+  <h3 style="margin-top:0">Pickleball Court Availability</h3>
   {% for d in days %}
     <h4>{{ d }}</h4>
     <div class="table">
@@ -312,7 +290,6 @@ RESULTS = """
 </div>
 """
 
-# ----- Admin: Availability Editor -----
 ADMIN_AVAIL_TPL = """
 <div class="glass">
   <h1 class="heading">Admin: Court Availability</h1>
@@ -371,6 +348,26 @@ ADMIN_AVAIL_TPL = """
 </div>
 """
 
+# --- Bookmarklet Import Page ---
+ADMIN_BM_TPL = """
+<div class="glass">
+  <h1 class="heading">Import from Club Automation (Bookmarklet)</h1>
+  <p class="sub">1) Drag the button below to your bookmarks bar.<br>
+  2) Go to the Club Automation page (logged in). Choose <b>Saturday</b> or <b>Sunday</b>.<br>
+  3) Click the bookmark. It will send visible courts/slots into this app.</p>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">Bookmarklet</h3>
+  <p>Drag this to your bookmarks bar:</p>
+  <p>
+    <a class="btn primary" href="{{ bookmarklet_js }}">Court Import</a>
+  </p>
+  <p class="note">If your site names differ (e.g., "Court 1" vs "Pickleball Court 1"), the importer tries to match. You can edit names after import via Admin.</p>
+  <a class="btn link" href="{{ url_for('results') }}">Back to Dashboard</a>
+</div>
+"""
+
 def render_view(tpl, **ctx):
     body = render_template_string(tpl, **ctx)
     return render_template_string(BASE, content=body, **ctx, app_name=APP_NAME)
@@ -412,6 +409,7 @@ def results():
 
 @app.post("/reset")
 def reset():
+    # simple inline template for reset prompt
     return render_view("""<div class="card"><h2>Reset Votes (Admin)</h2>
         <form method="POST" action="{{ url_for('confirm_reset') }}" class="form">
           <label><span>Enter PIN</span><input type="password" name="pin" placeholder="PIN" required></label>
@@ -461,7 +459,7 @@ def admin_availability_post():
         conn.commit()
     conn.close()
     flash("Time slot added.", "success")
-    return redirect(url_for("admin_availability"))
+    return redirect(url_for('admin_availability'))
 
 @app.post("/admin/availability/clear")
 def admin_availability_clear():
@@ -469,9 +467,135 @@ def admin_availability_clear():
     if pin != RESET_PIN:
         flash("Invalid PIN.", "error")
         return redirect(url_for("admin_availability"))
-    conn = db(); conn.execute("DELETE FROM availability"); conn.commit(); conn.close()
+    clear_all_availability()
     flash("All availability cleared.", "success")
     return redirect(url_for("admin_availability"))
+
+# ----- Bookmarklet Import -----
+def _bookmarklet_js(origin_base:str):
+    """
+    Builds a bookmarklet that runs in Club Automation page context and POSTs
+    found courts/slots to our /ingest/availability endpoint. Assumes the user
+    has selected either Saturday or Sunday on that page; the script asks which.
+    """
+    # NOTE: You can tune the selectors below once you inspect Club Automation DOM.
+    # We start with generic guesses: rows that contain court names and slot labels.
+    js = f"""
+    javascript:(function(){{
+      try {{
+        var day = window.prompt('Enter day to import for (Saturday or Sunday):','Saturday');
+        if(!day) return;
+        day = day.trim();
+        if(!/^(Saturday|Sunday)$/i.test(day)) {{ alert('Please enter Saturday or Sunday'); return; }}
+        var DAY = day[0].toUpperCase()+day.slice(1).toLowerCase();
+
+        // Heuristics: try to find court containers and slot labels
+        // Adjust selectors to match Club Automation structure as needed.
+        var nodes = document.querySelectorAll('.court, .resource, .facility, [data-court], [data-resource], .reservation-court');
+        if(!nodes.length) nodes = document.querySelectorAll('div');
+
+        var data = {{}};
+        function normalizeCourtName(txt) {{
+          var t = (txt||'').trim();
+          // Try to map to our known labels
+          var labels = {json.dumps(ALL_COURTS)};
+          for (var i=0;i<labels.length;i++) {{
+            var L = labels[i];
+            if (t.toLowerCase().indexOf(L.toLowerCase())>=0) return L;
+          }}
+          return null;
+        }}
+
+        nodes.forEach(function(n){{
+          var text = n.getAttribute('data-name') || n.getAttribute('data-court') || n.getAttribute('data-resource') || n.textContent || '';
+          var cname = normalizeCourtName(text);
+          if(!cname) return;
+          if(!data[cname]) data[cname] = [];
+          // Find times near this node
+          var slots = [];
+          var slotNodes = n.querySelectorAll('.slot, .time-slot, .slot-label, .reservation-time, [data-time], time');
+          if(!slotNodes.length) {{
+            // fallback: search nearby siblings
+            slotNodes = (n.parentElement||document).querySelectorAll('.slot, .time-slot, .slot-label, .reservation-time, [data-time], time');
+          }}
+          slotNodes.forEach(function(s){{
+            var v = s.getAttribute('data-time') || s.textContent || '';
+            v = v.replace(/\\s+/g,' ').trim();
+            if(v && slots.indexOf(v)<0) slots.push(v);
+          }});
+          // If no slots at this node, try detecting time-like strings inside text
+          if(!slots.length) {{
+            var m = text.match(/\\b(\\d{{1,2}}:?\\d{{0,2}}\\s?(?:AM|PM|am|pm)?\\s?[-–—]\\s?\\d{{1,2}}:?\\d{{0,2}}\\s?(?:AM|PM|am|pm)?)/g);
+            if(m) slots = m.map(function(x){{return x.trim();}});
+          }}
+          slots.forEach(function(s){{ if(data[cname].indexOf(s)<0) data[cname].push(s); }});
+        }});
+
+        var payload = JSON.stringify({{day: DAY, mapping: data}});
+        fetch('{origin_base}/ingest/availability', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: payload,
+          credentials: 'omit'
+        }}).then(function(res) {{
+          if(!res.ok) throw new Error('HTTP '+res.status);
+          return res.json();
+        }}).then(function(resp){{
+          alert('Imported '+ (resp.imported||0) +' slots for '+DAY+' across '+ (resp.courts||0) +' courts.');
+        }}).catch(function(err){{
+          console.error(err);
+          alert('Import failed: '+err.message+' — You can still add slots in Admin page.');
+        }});
+      }} catch(e) {{
+        console.error(e);
+        alert('Import error: '+e.message);
+      }}
+    }})();"""
+    # Minify very lightly (remove line breaks)
+    return js.replace("\n"," ").replace("  "," ")
+
+@app.get("/admin/bookmarklet")
+def admin_bookmarklet():
+    # Build absolute origin for this app (used by the bookmarklet POST)
+    origin = request.url_root.rstrip("/")
+    bm_js = _bookmarklet_js(origin)
+    return render_view(ADMIN_BM_TPL, bookmarklet_js=bm_js)
+
+@app.post("/ingest/availability")
+def ingest_availability():
+    """
+    Receives JSON: { "day": "Saturday"|"Sunday", "mapping": {"Court 1": ["9:00–10:00", ...], ...} }
+    Saves into DB for the given day (replacing existing).
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        day = (data.get("day") or "").strip()
+        mapping = data.get("mapping") or {}
+        if day not in DAYS:
+            return jsonify(ok=False, error="Invalid day"), 400
+        # Clean mapping keys to our known court labels
+        clean = {}
+        for k, v in mapping.items():
+            if not isinstance(v, list): continue
+            # match incoming name to one of our known labels
+            label = next((L for L in ALL_COURTS if L.lower() in (k or "").lower()), None)
+            if not label: continue
+            # normalize slot strings
+            slots = []
+            for s in v:
+                s = (s or "").strip()
+                if s and s not in slots:
+                    slots.append(s)
+            clean[label] = slots
+        # Insert
+        before = get_availability_times().get(day, {})
+        bulk_upsert_availability(day, clean)
+        after = get_availability_times().get(day, {})
+        imported_slots = sum(len(v) for v in after.values())
+        courts_with_data = sum(1 for v in after.values() if v)
+        return jsonify(ok=True, imported=imported_slots, courts=courts_with_data)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
 
 if __name__ == "__main__":
     # IMPORTANT: bind to host/port from your platform (Render sets PORT)

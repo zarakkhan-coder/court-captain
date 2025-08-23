@@ -1,27 +1,35 @@
-# CourtCaptain — Votes + Names, 4-player rule, Weather, Manual Availability, Bookmarklet Importer, Booking Button
+# CourtCaptain — Minimal vote form (Name + Day + Time), real-time availability fetch,
+# weather with icon, auto-suggest court from majority vote, "Votes Casted" KPI,
+# and a cleaner UI with pickleball side graphics.
+#
+# Works on Render or any host. If Club Automation requires login, set CLUB_COOKIE
+# (see "Simple steps" below).
 
 from flask import Flask, request, redirect, url_for, render_template_string, flash, jsonify
-from datetime import datetime, timezone, date
-import os, sqlite3, requests, json
+from datetime import datetime, timezone, date, time as dtime
+import os, sqlite3, requests, re
+from bs4 import BeautifulSoup
 
 APP_NAME = "CourtCaptain"
 PREFERRED_COURTS = ["Court 1", "Court 2", "Court 3", "Court 4"]
 ALL_COURTS = PREFERRED_COURTS + ["Court 5", "Court 6", "Court 7", "Outdoor A", "Outdoor B", "Other"]
 DAYS = ["Saturday", "Sunday"]
 
-# --- Environment (Render → Environment) ---
+# ------ Environment (Render → Environment) ------
 RESET_PIN   = os.environ.get("RESET_PIN", "1234")
 SECRET_KEY  = os.environ.get("SECRET_KEY", "replace-me")
 BOOKING_URL = os.environ.get("BOOKING_URL", "https://walmart.clubautomation.com/event/reserve-court-new")
 LAT = float(os.environ.get("WALTON_LAT", "36.372"))
 LON = float(os.environ.get("WALTON_LON", "-94.208"))
+# If the site needs login, paste your browser cookie value here (Render → Environment)
+CLUB_COOKIE = os.environ.get("CLUB_COOKIE", "")
 
 DB_PATH = "data.db"
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
-# ---------- DB ----------
+# ---------------- DB ----------------
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -30,56 +38,106 @@ def db():
 def init_db():
     conn = db()
     c = conn.cursor()
+    # minimal vote: name + day + time_text (free text like "9:00-10:00" or "10am")
     c.execute("""CREATE TABLE IF NOT EXISTS votes(
-        name  TEXT PRIMARY KEY,
-        day   TEXT NOT NULL,
-        court TEXT NOT NULL,
-        ts    TEXT NOT NULL
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS availability(
-        day   TEXT NOT NULL,
-        court TEXT NOT NULL,
-        slot  TEXT NOT NULL
+        name      TEXT PRIMARY KEY,
+        day       TEXT NOT NULL,
+        time_text TEXT NOT NULL,
+        ts        TEXT NOT NULL
     )""")
     conn.commit(); conn.close()
 init_db()
 
-# ---------- helpers ----------
-def pref_rank(court):
-    return PREFERRED_COURTS.index(court) if court in PREFERRED_COURTS else 100 + ALL_COURTS.index(court)
+# --------------- Helpers ---------------
+TIME_PATTERN = re.compile(r"\b(\d{1,2})(?::?(\d{2}))?\s*(am|pm|AM|PM)?\s*[-–—]\s*(\d{1,2})(?::?(\d{2}))?\s*(am|pm|AM|PM)?\b")
+ONE_TIME_PATTERN = re.compile(r"\b(\d{1,2})(?::?(\d{2}))?\s*(am|pm|AM|PM)?\b")
 
-def day_rank(day): return 0 if day == "Saturday" else 1
+def to_minutes(h, m, ap=None):
+    h = int(h); m = int(m) if m else 0
+    if ap:
+        ap = ap.lower()
+        if ap == "pm" and h != 12: h += 12
+        if ap == "am" and h == 12: h = 0
+    return h*60 + m
 
-def is_outdoor(court:str)->bool: return "outdoor" in court.lower()
+def parse_time_window(text):
+    """
+    Parse "9-10am", "9:00-10:00", "9am-10am", "9:30–10:30", etc → (start_min, end_min)
+    If only one time is provided, return (t, t).
+    """
+    if not text: return None
+    text = text.strip()
+    m = TIME_PATTERN.search(text)
+    if m:
+        sh, sm, sap, eh, em, eap = m.groups()
+        start = to_minutes(sh, sm, sap)
+        end   = to_minutes(eh, em, eap) if (eh) else start
+        return (start, end)
+    # fallback single time like "9am"
+    m2 = ONE_TIME_PATTERN.search(text)
+    if m2:
+        h, mm, ap = m2.groups()
+        t = to_minutes(h, mm, ap)
+        return (t, t)
+    return None
 
-def tally_with_names():
-    conn = db()
-    rows = conn.execute("SELECT name, day, court FROM votes").fetchall()
-    conn.close()
-    unique_players = set()
+def minute_diff(a, b):
+    return abs(a - b)
+
+def majority_choice(votes):
+    """
+    From DB rows -> majority (day, time_window). If tie, prefer Saturday.
+    Returns {'day': 'Saturday', 'time_text': '9:00-10:00', 'window':(start,end), 'votes':N}
+    """
+    # counts by (day, normalized_time_window)
     buckets = {}
-    for r in rows:
-        nm = (r["name"] or "").strip()
-        if not nm: continue
-        unique_players.add(nm.lower())
-        key = (r["day"], r["court"])
-        if key not in buckets: buckets[key] = {"votes":0, "names":[]}
-        buckets[key]["votes"] += 1
-        buckets[key]["names"].append(nm)
-    ranked = sorted(buckets.items(), key=lambda kv:(-kv[1]["votes"], pref_rank(kv[0][1]), day_rank(kv[0][0])))
-    top = None
-    if ranked:
-        (d,c), info = ranked[0]
-        top = {"day":d, "court":c, "votes":info["votes"], "names":sorted(info["names"])}
-    counts = [{"day":d, "court":c, "votes":info["votes"], "names":sorted(info["names"])} for (d,c),info in ranked]
-    return {"total_players":len(unique_players), "counts":counts, "top_choice":top, "booking_possible":len(unique_players)>=4}
+    pretty_time = {}
+    for v in votes:
+        day = v["day"]
+        time_text = (v["time_text"] or "").strip()
+        win = parse_time_window(time_text)
+        if not win:  # skip invalid
+            continue
+        key = (day, win)
+        buckets[key] = buckets.get(key, 0) + 1
+        # remember a nice display string
+        if key not in pretty_time: pretty_time[key] = time_text
 
-def fetch_weather_all():
+    if not buckets:
+        return None
+
+    ranked = sorted(
+        buckets.items(),
+        key=lambda kv: (-kv[1], 0 if kv[0][0]=="Saturday" else 1)
+    )
+    (day, win), count = ranked[0]
+    return {"day": day, "window": win, "time_text": pretty_time[(day, win)], "votes": count}
+
+# ---- Weather (with icon) via Open-Meteo ----
+def weather_icon(code, pop):
+    # Simple mapping for icons (emoji) by weathercode; fallback by precipitation
+    # Open-Meteo weathercode reference:
+    # 0 Clear, 1-3 Partly cloudy, 45/48 Fog, 51-57 Drizzle, 61-67 Rain, 71-77 Snow, 80-82 Rain showers, 95-99 Thunder
+    if code == 0: return "☀️"
+    if code in (1,2,3): return "⛅"
+    if code in (45,48): return "🌫️"
+    if code in (51,53,55,56,57): return "🌦️"
+    if code in (61,63,65,66,67,80,81,82): return "🌧️"
+    if code in (71,73,75,77): return "❄️"
+    if code in (95,96,99): return "⛈️"
+    if pop and int(pop) >= 50: return "🌧️"
+    return "🌤️"
+
+def fetch_weather_days():
+    """
+    Return {'Saturday': {'tmax':..,'tmin':..,'pop':..,'code':..,'icon':'...'},
+            'Sunday': {...}}
+    """
     out = {}
     try:
         url = ("https://api.open-meteo.com/v1/forecast"
                f"?latitude={LAT}&longitude={LON}"
-               "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+               "&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
                "&forecast_days=7&timezone=auto")
         r = requests.get(url, timeout=8); r.raise_for_status()
         d = r.json().get("daily", {})
@@ -87,50 +145,109 @@ def fetch_weather_all():
         tmax  = d.get("temperature_2m_max", [])
         tmin  = d.get("temperature_2m_min", [])
         pop   = d.get("precipitation_probability_max", [])
+        code  = d.get("weathercode", [])
         for i, ds in enumerate(times):
             y,m,dd = map(int, ds.split("-"))
             wname = date(y,m,dd).strftime("%A")
             if wname in ("Saturday","Sunday"):
-                out[wname] = {"date":ds, "tmax":tmax[i], "tmin":tmin[i], "pop":pop[i]}
+                icon = weather_icon(code[i] if i < len(code) else None,
+                                    pop[i] if i < len(pop) else None)
+                out[wname] = {"tmax": tmax[i], "tmin": tmin[i],
+                              "pop": pop[i], "code": code[i], "icon": icon}
         return out
     except Exception:
         return out
 
-def get_availability_times():
-    """Return {'Saturday': {'Court 1':[...], ...}, 'Sunday': {...}} from DB."""
-    result = {d: {c: [] for c in ALL_COURTS} for d in DAYS}
-    conn = db()
-    rows = conn.execute("SELECT day, court, slot FROM availability").fetchall()
-    conn.close()
-    for r in rows:
-        day, court, slot = r["day"], r["court"], r["slot"]
-        if day in result and court in result[day]:
-            if slot not in result[day][court]:
-                result[day][court].append(slot)
-    for d in DAYS:
-        for c in ALL_COURTS:
-            result[d][c].sort()
-    return result
+# ---- Real-time availability from Club Automation ----
+BASE_CA_URL = "https://walmart.clubautomation.com/event/reserve-court-new"
 
-def clear_all_availability():
-    conn = db(); conn.execute("DELETE FROM availability"); conn.commit(); conn.close()
-
-def bulk_upsert_availability(day:str, mapping:dict):
+def fetch_availability_for_day(day):
     """
-    mapping: {'Court 1': ['9:00–10:00', ...], 'Court 2': [...], ...}
-    Clears existing rows for that day and inserts fresh.
+    For the chosen day, fetch each court page and extract time slots.
+    Returns {'Court 1': ['9:00-10:00', ...], ...}
+    NOTE: If the site needs login, set CLUB_COOKIE env var with your session cookie.
     """
-    if day not in DAYS: return
-    conn = db()
-    conn.execute("DELETE FROM availability WHERE day=?", (day,))
-    for court, slots in mapping.items():
-        if court not in ALL_COURTS: continue
-        for s in slots:
-            if not s: continue
-            conn.execute("INSERT INTO availability(day, court, slot) VALUES(?,?,?)", (day, court, s))
-    conn.commit(); conn.close()
+    headers = {}
+    if CLUB_COOKIE:
+        headers["Cookie"] = CLUB_COOKIE
 
-# ---------- templates ----------
+    slots_by_court = {c: [] for c in ALL_COURTS}
+
+    for court in ALL_COURTS:
+        try:
+            params = {"day": day, "court": court}
+            r = requests.get(BASE_CA_URL, params=params, headers=headers, timeout=10)
+            r.raise_for_status()
+            html = r.text
+            soup = BeautifulSoup(html, "html.parser")
+
+            # 1) Try obvious slot elements
+            slot_nodes = soup.select(".slot, .time-slot, .slot-label, .reservation-time, time, [data-time]")
+            found = set()
+            for sn in slot_nodes:
+                t = sn.get("data-time") or sn.get_text(" ", strip=True)
+                t = re.sub(r"\s+", " ", t or "").strip()
+                # Convert '9:00 AM - 10:00 AM' → '9:00-10:00' style (simple normalize)
+                t = t.replace("AM", "am").replace("PM", "pm")
+                t = re.sub(r"\s*-\s*", "-", t)
+                if t and re.search(r"\d", t):
+                    found.add(t)
+
+            # 2) Fallback: scan all text for time windows
+            if not found:
+                for m in TIME_PATTERN.finditer(soup.get_text(" ", strip=True)):
+                    sh, sm, sap, eh, em, eap = m.groups()
+                    left = f"{sh}:{sm or '00'}{(''+sap).lower() if sap else ''}"
+                    right = f"{eh}:{em or '00'}{(''+eap).lower() if eap else ''}"
+                    found.add(f"{left}-{right}")
+
+            slots_by_court[court] = sorted(list(found))
+        except Exception:
+            # leave it empty if error
+            pass
+
+    return slots_by_court
+
+def pick_best_court(day, want_window, avail_map):
+    """
+    Choose the best court given preferred window and availability map.
+    Priority: exact time match on preferred courts 1–4 → exact on others →
+              nearest-time on preferred → nearest-time on others.
+    Returns {'court': 'Court 1', 'slot': '9:00-10:00', 'match':'exact'|'near', 'diff_min':X} or None
+    """
+    if not want_window: return None
+    start_want = (want_window[0] + want_window[1]) // 2  # mid-point
+
+    def slot_mid_minutes(slot_text):
+        win = parse_time_window(slot_text)
+        if not win: return None
+        return (win[0] + win[1]) // 2
+
+    # Helper to scan with a set of courts and exact/near flag
+    def scan(courts, exact=True):
+        best = None
+        for c in courts:
+            for s in avail_map.get(c, []):
+                sw = parse_time_window(s)
+                if not sw: continue
+                if exact:
+                    # exact-ish: overlapping windows
+                    if not (sw[1] >= want_window[0] and sw[0] <= want_window[1]):
+                        continue
+                mid = (sw[0] + sw[1]) // 2
+                diff = minute_diff(mid, start_want)
+                if (best is None) or (diff < best["diff_min"]):
+                    best = {"court": c, "slot": s, "match": "exact" if exact else "near", "diff_min": diff}
+        return best
+
+    # Try exact on preferred → exact on others → near on preferred → near on others
+    others = [c for c in ALL_COURTS if c not in PREFERRED_COURTS]
+    for courts, exact in [(PREFERRED_COURTS, True), (others, True), (PREFERRED_COURTS, False), (others, False)]:
+        found = scan(courts, exact=exact)
+        if found: return found
+    return None
+
+# --------------- Templates ---------------
 BASE = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -140,25 +257,26 @@ BASE = """
 <style>
 :root{--bg:#0b1220;--card:#121a2b;--glass:rgba(255,255,255,.06);--text:#e8eefc;--muted:#9fb0d6;--primary:#5ea1ff;--accent:#22d3ee;--success:#22c55e;--warn:#f59e0b;--danger:#ef4444;--border:#1f2a44;--shadow:0 12px 28px rgba(0,0,0,.35)}
 *{box-sizing:border-box} html,body{margin:0;padding:0;background:linear-gradient(180deg,#0a0f1a,#0b1220);color:var(--text);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif}
-.page{max-width:1000px;margin:24px auto;padding:0 18px}
-.header{position:sticky;top:0;background:var(--glass);backdrop-filter:blur(10px);border:1px solid var(--border);border-radius:14px;padding:14px 18px;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between;box-shadow:var(--shadow);animation: fadeIn .5s ease}
+.page{max-width:1100px;margin:24px auto;padding:0 18px;position:relative}
+.side-art{position:fixed;top:10%;bottom:10%;left:0;right:0;pointer-events:none;display:flex;justify-content:space-between;opacity:.15}
+.paddle{width:160px;height:240px;border-radius:40px;background:radial-gradient(circle at 30% 30%,#3fd0ff,transparent 60%),#1b2a44;border:6px solid #2b4b7a;box-shadow:0 20px 40px rgba(0,0,0,.4);transform:rotate(-12deg)}
+.paddle.right{transform:scaleX(-1) rotate(-12deg)}
+.ball{width:40px;height:40px;border-radius:999px;background:#ffd54a;box-shadow:0 8px 18px rgba(0,0,0,.45);align-self:center}
+.header{position:sticky;top:0;background:var(--glass);backdrop-filter:blur(10px);border:1px solid var(--border);border-radius:14px;padding:14px 18px;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between;box-shadow:var(--shadow);animation:fadeIn .5s ease}
 .brand{display:flex;gap:10px;align-items:center}.logo{font-size:24px}.title{font-weight:800}
 .nav{display:flex;gap:12px}.nav a{padding:8px 12px;border-radius:10px;color:var(--muted);text-decoration:none;transition:.2s}
 .nav a:hover{background:rgba(255,255,255,.06);color:var(--text);transform: translateY(-1px)}
 .flash{margin:14px 0;padding:12px 14px;border-radius:12px;border:1px solid var(--border)}.flash.success{background:rgba(34,197,94,.12)}.flash.error{background:rgba(239,68,68,.12)}
-.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:20px;box-shadow:var(--shadow);margin-bottom:18px;transition: transform .15s ease, box-shadow .15s ease;animation: fadeIn .4s ease}
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:20px;box-shadow:var(--shadow);margin-bottom:18px;transition:transform .15s ease,box-shadow .15s ease;animation:fadeIn .4s ease}
 .card:hover{transform: translateY(-2px);box-shadow:0 14px 30px rgba(0,0,0,.4)}
-.glass{background:var(--glass);border:1px solid var(--border);border-radius:14px;padding:18px;margin-bottom:18px;animation: fadeIn .4s ease}
+.glass{background:var(--glass);border:1px solid var(--border);border-radius:14px;padding:18px;margin-bottom:18px;animation:fadeIn .4s ease}
 .heading{margin:0 0 6px 0;font-size:28px}.sub{margin:0;color:var(--muted)}
-.form{display:flex;flex-direction:column;gap:14px}.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}@media(max-width:840px){.grid{grid-template-columns:1fr}}
+.form{display:flex;flex-direction:column;gap:14px}.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}@media(max-width:900px){.grid{grid-template-columns:1fr}}
 label span{display:block;margin-bottom:8px;color:var(--muted)}
 input,select{width:100%;padding:12px;border-radius:10px;border:1px solid var(--border);background:#0f1627;color:var(--text)} input:focus,select:focus{outline:none;border-color:var(--primary)}
 .btn{display:inline-flex;align-items:center;gap:8px;padding:12px 14px;border-radius:12px;border:1px solid var(--border);cursor:pointer;background:#0f1627;color:var(--text);transition:.2s}
 .btn.primary{background:linear-gradient(135deg,var(--primary),#7cd2ff);color:#06101f;border:none}
 .btn.primary:hover{filter:brightness(1.05);transform: translateY(-1px)}
-.btn.link{background:transparent;border:none;color:var(--primary)}
-.btn.danger{background:linear-gradient(135deg,#ef4444,#f87171);border:none}
-.btn.danger:hover{filter:brightness(1.05);transform: translateY(-1px)}
 .table{display:flex;flex-direction:column;gap:10px}
 .row{display:grid;grid-template-columns:1.2fr 1.2fr 1fr;gap:12px;background:#0f1627;border:1px solid var(--border);border-radius:12px;padding:12px}
 .head{background:transparent;border-style:dashed;font-weight:600}
@@ -169,13 +287,15 @@ input,select{width:100%;padding:12px;border-radius:10px;border:1px solid var(--b
 .footer{margin:18px 0;color:var(--muted);text-align:center}
 @keyframes fadeIn {from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:none}}
 </style></head><body><div class="page">
+
+<div class="side-art">
+  <div class="paddle"></div>
+  <div class="ball"></div>
+  <div class="paddle right"></div>
+</div>
+
 <div class="header"><div class="brand"><div class="logo">🏓</div><div class="title">{{ app_name }}</div></div>
-<div class="nav">
-  <a href="{{ url_for('home') }}">Vote</a>
-  <a href="{{ url_for('results') }}">Results</a>
-  <a href="{{ url_for('admin_availability') }}">Admin</a>
-  <a href="{{ url_for('admin_bookmarklet') }}">Import</a>
-</div></div>
+<div class="nav"><a href="{{ url_for('home') }}">Vote</a><a href="{{ url_for('results') }}">Results</a></div></div>
 {% with messages = get_flashed_messages(with_categories=true) %}{% for cat,msg in messages %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}{% endwith %}
 {{ content|safe }}
 <div class="footer">© {{ app_name }}</div>
@@ -184,7 +304,8 @@ input,select{width:100%;padding:12px;border-radius:10px;border:1px solid var(--b
 
 INDEX = """
 <div class="glass"><h1 class="heading">Weekend Pickleball Poll — Walton Fitness Centre</h1>
-<p class="sub">Vote by <b>Wednesday 6pm</b>. Need <b>4+ players</b> to book. Preferred courts: <b>1–4</b>.</p></div>
+<p class="sub">Enter your name, pick a day, and tell us your preferred time (e.g., "9-10am").</p></div>
+
 <div class="card">
   <form method="POST" class="form">
     <div class="grid">
@@ -195,16 +316,13 @@ INDEX = """
           {% for d in days %}<option value="{{ d }}">{{ d }}</option>{% endfor %}
         </select>
       </label>
-      <label><span>Preferred court</span>
-        <select name="court" required>
-          <option value="" disabled selected>Choose</option>
-          {% for c in courts %}<option value="{{ c }}">{{ c }}{% if c in preferred %} ★{% endif %}</option>{% endfor %}
-        </select>
+      <label><span>Preferred time (e.g., 9-10am or 9:30-10:30)</span>
+        <input name="time_text" required placeholder="e.g., 9-10am">
       </label>
     </div>
     <div style="display:flex;gap:10px;flex-wrap:wrap">
       <button class="btn primary" type="submit">Submit Vote</button>
-      <a class="btn link" href="{{ url_for('results') }}">See Results</a>
+      <a class="btn" href="{{ url_for('results') }}">Go to Results</a>
     </div>
   </form>
 </div>
@@ -215,216 +333,126 @@ RESULTS = """
 <div class="glass">
   <h1 class="heading">Dashboard</h1>
   <div class="kpi">
-    <div class="pill">Players: <b>{{ s.total_players }}</b></div>
-    {% if s.booking_possible %}
-      <div class="pill">Status: <b>Booking possible (≥4)</b></div>
-    {% else %}
-      <div class="pill">Status: <b>Need ≥4</b></div>
-    {% endif %}
-    <div class="pill">Weather Sat:
-      {% if wx.Saturday %} <span class="badge">{{ wx.Saturday.tmin|int }}–{{ wx.Saturday.tmax|int }}°C • {{ wx.Saturday.pop|default('?') }}% rain</span>
-      {% else %} <span class="badge">—</span>{% endif %}
+    <div class="pill">Votes Casted: <b>{{ s.total_players }}</b></div>
+    <div class="pill">Saturday: <span class="badge">{{ wx.Saturday.icon if wx.Saturday else '—' }}</span>
+      {% if wx.Saturday %}<span class="badge">{{ wx.Saturday.tmin|int }}–{{ wx.Saturday.tmax|int }}°C • {{ wx.Saturday.pop|int }}% rain</span>{% endif %}
     </div>
-    <div class="pill">Weather Sun:
-      {% if wx.Sunday %} <span class="badge">{{ wx.Sunday.tmin|int }}–{{ wx.Sunday.tmax|int }}°C • {{ wx.Sunday.pop|default('?') }}% rain</span>
-      {% else %} <span class="badge">—</span>{% endif %}
+    <div class="pill">Sunday: <span class="badge">{{ wx.Sunday.icon if wx.Sunday else '—' }}</span>
+      {% if wx.Sunday %}<span class="badge">{{ wx.Sunday.tmin|int }}–{{ wx.Sunday.tmax|int }}°C • {{ wx.Sunday.pop|int }}% rain</span>{% endif %}
     </div>
   </div>
 </div>
 
-{% if s.top_choice %}
+{% if s.majority %}
 <div class="card" style="border-color:#22d3ee">
-  <h3 style="margin-top:0">Top Choice</h3>
-  <p style="font-size:20px">
-    <b>{{ s.top_choice.day }}</b> on <b>{{ s.top_choice.court }}</b>
-    <span class="sub">({{ s.top_choice.votes }} votes)</span>
+  <h3 style="margin-top:0">Majority Pick</h3>
+  <p style="font-size:18px">
+    <b>{{ s.majority.day }}</b> • <b>{{ s.majority.time_text }}</b>
+    <span class="sub">({{ s.majority.votes }} vote{{ '' if s.majority.votes==1 else 's' }})</span>
   </p>
-  {% if s.top_choice.names %}
-    <div class="voters">Voters: {{ s.top_choice.names | join(', ') }}</div>
+  {% if s.suggestion %}
+    <p style="margin-top:8px">Suggested Court: <b>{{ s.suggestion.court }}</b> — <b>{{ s.suggestion.slot }}</b>
+    <span class="badge">{{ 'Exact match' if s.suggestion.match=='exact' else 'Nearest time' }}</span></p>
+    <form method="POST" action="{{ url_for('book_court') }}">
+      <input type="hidden" name="day" value="{{ s.majority.day }}">
+      <input type="hidden" name="court" value="{{ s.suggestion.court }}">
+      <button class="btn primary" type="submit">Book Court</button>
+    </form>
+  {% else %}
+    <p class="sub">No suitable court/slot found yet for the majority time.</p>
   {% endif %}
-  <form method="POST" action="{{ url_for('book_court') }}" style="margin-top:12px;">
-    <input type="hidden" name="day" value="{{ s.top_choice.day }}">
-    <input type="hidden" name="court" value="{{ s.top_choice.court }}">
-    <button class="btn primary" type="submit">Book Court</button>
-  </form>
-  <p class="note">Ranking: votes → preferred courts (1–4) → Saturday over Sunday.</p>
+  <p class="note">Ranking logic: votes → preferred courts (1–4) → exact time → nearest time.</p>
 </div>
 {% endif %}
 
 <div class="card">
-  <h3 style="margin-top:0">Vote Breakdown (with names)</h3>
+  <h3 style="margin-top:0">Real-Time Availability for {{ s.majority.day if s.majority else 'Saturday/Sunday' }}</h3>
   <div class="table">
-    <div class="row head"><div>Day</div><div>Court & Voters</div><div>Votes</div></div>
-    {% for item in s.counts %}
+    <div class="row head"><div>Court</div><div>Open Slots</div><div>Preferred</div></div>
+    {% for c in courts %}
       <div class="row">
-        <div>{{ item.day }}</div>
-        <div>
-          {{ item.court }}{% if item.court in preferred %} ★{% endif %}
-          {% if item.names and item.names|length > 0 %}
-            <div class="voters">Voters: {{ item.names | join(', ') }}</div>
-          {% endif %}
-        </div>
-        <div>{{ item.votes }}</div>
+        <div>{{ c }}</div>
+        <div>{% if avail.get(c) and avail.get(c)|length > 0 %}{{ avail.get(c) | join(', ') }}{% else %}—{% endif %}</div>
+        <div>{% if c in preferred %}Yes{% else %}—{% endif %}</div>
       </div>
-    {% else %}
-      <div class="row"><div>No votes yet. Share the link!</div><div></div><div></div></div>
     {% endfor %}
   </div>
 </div>
 
 <div class="card">
-  <h3 style="margin-top:0">Pickleball Court Availability</h3>
-  {% for d in days %}
-    <h4>{{ d }}</h4>
-    <div class="table">
-      <div class="row head"><div>Court</div><div>Open Slots</div><div></div></div>
-      {% for c in courts %}
-        <div class="row">
-          <div>{{ c }}</div>
-          <div>{% if avail[d][c] and avail[d][c]|length > 0 %}{{ avail[d][c] | join(', ') }}{% else %}—{% endif %}</div>
-          <div>{% if c in preferred %}Preferred{% endif %}</div>
-        </div>
-      {% endfor %}
-    </div>
-  {% endfor %}
+  <h3 style="margin-top:0">Votes (who chose what)</h3>
+  <div class="table">
+    <div class="row head"><div>Name</div><div>Day</div><div>Time</div></div>
+    {% for v in raw_votes %}
+      <div class="row"><div>{{ v.name }}</div><div>{{ v.day }}</div><div>{{ v.time_text }}</div></div>
+    {% else %}
+      <div class="row"><div>No votes yet.</div><div></div><div></div></div>
+    {% endfor %}
+  </div>
 </div>
 """
 
-ADMIN_AVAIL_TPL = """
-<div class="glass">
-  <h1 class="heading">Admin: Court Availability</h1>
-  <p class="sub">Add time slots per court and day. Use your PIN below to clear all if needed.</p>
-</div>
-
-<div class="card">
-  <form method="POST" class="form">
-    <div class="grid">
-      <label><span>Day</span>
-        <select name="day" required>
-          {% for d in days %}<option value="{{ d }}">{{ d }}</option>{% endfor %}
-        </select>
-      </label>
-      <label><span>Court</span>
-        <select name="court" required>
-          {% for c in courts %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
-        </select>
-      </label>
-      <label><span>Time slot (e.g., 9:00–10:00)</span>
-        <input name="slot" placeholder="9:00–10:00" required>
-      </label>
-    </div>
-    <button class="btn primary" type="submit">Add Slot</button>
-    <a class="btn link" href="{{ url_for('results') }}">Back to Dashboard</a>
-  </form>
-</div>
-
-<div class="card">
-  <h3 style="margin-top:0">Current Availability</h3>
-  {% for d in days %}
-    <h4>{{ d }}</h4>
-    <div class="table">
-      <div class="row head"><div>Court</div><div>Slots</div><div></div></div>
-      {% for c in courts %}
-        <div class="row">
-          <div>{{ c }}</div>
-          <div>
-            {% if data[d][c] and data[d][c]|length > 0 %}
-              {{ data[d][c] | join(', ') }}
-            {% else %}—{% endif %}
-          </div>
-          <div>{% if c in preferred %}Preferred{% endif %}</div>
-        </div>
-      {% endfor %}
-    </div>
-  {% endfor %}
-</div>
-
-<div class="card">
-  <h3 style="margin-top:0">Clear All Availability</h3>
-  <form method="POST" action="{{ url_for('admin_availability_clear') }}" class="form" onsubmit="return confirm('Clear all slots?')">
-    <label><span>PIN</span><input type="password" name="pin" required placeholder="Enter PIN"></label>
-    <button class="btn danger" type="submit">Clear All</button>
-  </form>
-</div>
-"""
-
-# --- Bookmarklet Import Page ---
-ADMIN_BM_TPL = """
-<div class="glass">
-  <h1 class="heading">Import from Club Automation (Bookmarklet)</h1>
-  <p class="sub">1) Drag the button below to your bookmarks bar.<br>
-  2) Go to the Club Automation page (logged in). Choose <b>Saturday</b> or <b>Sunday</b>.<br>
-  3) Click the bookmark. It will send visible courts/slots into this app.</p>
-</div>
-
-<div class="card">
-  <h3 style="margin-top:0">Bookmarklet</h3>
-  <p>Drag this to your bookmarks bar:</p>
-  <p>
-    <a class="btn primary" href="{{ bookmarklet_js }}">Court Import</a>
-  </p>
-  <p class="note">If your site names differ (e.g., "Court 1" vs "Pickleball Court 1"), the importer tries to match. You can edit names after import via Admin.</p>
-  <a class="btn link" href="{{ url_for('results') }}">Back to Dashboard</a>
-</div>
-"""
-
-def render_view(tpl, **ctx):
-    body = render_template_string(tpl, **ctx)
-    return render_template_string(BASE, content=body, **ctx, app_name=APP_NAME)
-
-# ---------- routes ----------
+# --------------- Routes ---------------
 @app.get("/health")
 def health(): return jsonify(ok=True), 200
 
 @app.route("/", methods=["GET","POST"])
 def home():
     if request.method == "POST":
-        name  = (request.form.get("name") or "").strip()
-        day   = request.form.get("day")
-        court = request.form.get("court")
-        if not name or day not in DAYS or court not in ALL_COURTS:
-            flash("Please enter your name, a valid day, and a court.", "error")
+        name = (request.form.get("name") or "").strip()
+        day = request.form.get("day")
+        time_text = (request.form.get("time_text") or "").strip()
+        if not name or day not in DAYS or not time_text:
+            flash("Please enter your name, select a valid day, and provide a time like '9-10am'.", "error")
             return redirect(url_for("home"))
         conn = db()
         conn.execute(
-            "INSERT INTO votes(name, day, court, ts) VALUES(?,?,?,?) "
-            "ON CONFLICT(name) DO UPDATE SET day=excluded.day, court=excluded.court, ts=excluded.ts",
-            (name, day, court, datetime.now(timezone.utc).isoformat())
+            "INSERT INTO votes(name, day, time_text, ts) VALUES(?,?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET day=excluded.day, time_text=excluded.time_text, ts=excluded.ts",
+            (name, day, time_text, datetime.now(timezone.utc).isoformat())
         )
         conn.commit(); conn.close()
         flash("Vote submitted. Thanks!", "success")
         return redirect(url_for("results"))
-    return render_view(INDEX, days=DAYS, courts=ALL_COURTS, preferred=PREFERRED_COURTS)
+    return render_template_string(BASE, content=render_template_string(INDEX, days=DAYS), app_name=APP_NAME)
 
 @app.get("/results")
 def results():
-    s = tally_with_names()
-    wx = fetch_weather_all()
-    avail = get_availability_times()
-    return render_view(
+    # Pull raw votes
+    conn = db()
+    rows = conn.execute("SELECT name, day, time_text FROM votes").fetchall()
+    conn.close()
+
+    # Majority (day + time window)
+    majority = majority_choice(rows)
+
+    # Weather (Sat/Sun)
+    wx = fetch_weather_days()
+
+    # Real-time availability for chosen majority day (or Saturday if none yet)
+    chosen_day = majority["day"] if majority else "Saturday"
+    avail = fetch_availability_for_day(chosen_day)
+
+    # Suggest court from availability
+    suggestion = pick_best_court(chosen_day, majority["window"] if majority else None, avail) if majority else None
+
+    # Compose summary object
+    summary = {
+        "total_players": len(rows),
+        "majority": majority,
+        "suggestion": suggestion
+    }
+
+    html = render_template_string(
         RESULTS,
-        summary=s, preferred=PREFERRED_COURTS, courts=ALL_COURTS,
-        days=DAYS, wx=wx, avail=avail
+        summary=summary,
+        wx=wx,
+        avail=avail,
+        courts=ALL_COURTS,
+        preferred=PREFERRED_COURTS,
+        raw_votes=rows
     )
-
-@app.post("/reset")
-def reset():
-    # simple inline template for reset prompt
-    return render_view("""<div class="card"><h2>Reset Votes (Admin)</h2>
-        <form method="POST" action="{{ url_for('confirm_reset') }}" class="form">
-          <label><span>Enter PIN</span><input type="password" name="pin" placeholder="PIN" required></label>
-          <button class="btn danger" type="submit">Confirm Reset</button>
-          <a class="btn link" href="{{ url_for('home') }}">Cancel</a>
-        </form></div>""")
-
-@app.post("/confirm-reset")
-def confirm_reset():
-    if request.form.get("pin","") != RESET_PIN:
-        flash("Invalid PIN.", "error")
-        return redirect(url_for("home"))
-    conn = db(); conn.execute("DELETE FROM votes"); conn.commit(); conn.close()
-    flash("All votes cleared. Fresh week! 🏓", "success")
-    return redirect(url_for("home"))
+    return render_template_string(BASE, content=html, app_name=APP_NAME)
 
 @app.post("/book")
 def book_court():
@@ -438,165 +466,5 @@ def book_court():
     target = f"{BOOKING_URL}{sep}day={day}&court={court}"
     return redirect(target, code=302)
 
-# ----- Admin Availability Editor -----
-@app.get("/admin/availability")
-def admin_availability():
-    data = get_availability_times()
-    return render_view(ADMIN_AVAIL_TPL, days=DAYS, courts=ALL_COURTS, preferred=PREFERRED_COURTS, data=data)
-
-@app.post("/admin/availability")
-def admin_availability_post():
-    day = (request.form.get("day") or "").strip()
-    court = (request.form.get("court") or "").strip()
-    slot = (request.form.get("slot") or "").strip()
-    if day not in DAYS or court not in ALL_COURTS or not slot:
-        flash("Please choose a valid day, court, and slot.", "error")
-        return redirect(url_for("admin_availability"))
-    conn = db()
-    exists = conn.execute("SELECT 1 FROM availability WHERE day=? AND court=? AND slot=?", (day, court, slot)).fetchone()
-    if not exists:
-        conn.execute("INSERT INTO availability(day, court, slot) VALUES(?,?,?)", (day, court, slot))
-        conn.commit()
-    conn.close()
-    flash("Time slot added.", "success")
-    return redirect(url_for('admin_availability'))
-
-@app.post("/admin/availability/clear")
-def admin_availability_clear():
-    pin = request.form.get("pin","")
-    if pin != RESET_PIN:
-        flash("Invalid PIN.", "error")
-        return redirect(url_for("admin_availability"))
-    clear_all_availability()
-    flash("All availability cleared.", "success")
-    return redirect(url_for("admin_availability"))
-
-# ----- Bookmarklet Import -----
-def _bookmarklet_js(origin_base:str):
-    """
-    Builds a bookmarklet that runs in Club Automation page context and POSTs
-    found courts/slots to our /ingest/availability endpoint. Assumes the user
-    has selected either Saturday or Sunday on that page; the script asks which.
-    """
-    # NOTE: You can tune the selectors below once you inspect Club Automation DOM.
-    # We start with generic guesses: rows that contain court names and slot labels.
-    js = f"""
-    javascript:(function(){{
-      try {{
-        var day = window.prompt('Enter day to import for (Saturday or Sunday):','Saturday');
-        if(!day) return;
-        day = day.trim();
-        if(!/^(Saturday|Sunday)$/i.test(day)) {{ alert('Please enter Saturday or Sunday'); return; }}
-        var DAY = day[0].toUpperCase()+day.slice(1).toLowerCase();
-
-        // Heuristics: try to find court containers and slot labels
-        // Adjust selectors to match Club Automation structure as needed.
-        var nodes = document.querySelectorAll('.court, .resource, .facility, [data-court], [data-resource], .reservation-court');
-        if(!nodes.length) nodes = document.querySelectorAll('div');
-
-        var data = {{}};
-        function normalizeCourtName(txt) {{
-          var t = (txt||'').trim();
-          // Try to map to our known labels
-          var labels = {json.dumps(ALL_COURTS)};
-          for (var i=0;i<labels.length;i++) {{
-            var L = labels[i];
-            if (t.toLowerCase().indexOf(L.toLowerCase())>=0) return L;
-          }}
-          return null;
-        }}
-
-        nodes.forEach(function(n){{
-          var text = n.getAttribute('data-name') || n.getAttribute('data-court') || n.getAttribute('data-resource') || n.textContent || '';
-          var cname = normalizeCourtName(text);
-          if(!cname) return;
-          if(!data[cname]) data[cname] = [];
-          // Find times near this node
-          var slots = [];
-          var slotNodes = n.querySelectorAll('.slot, .time-slot, .slot-label, .reservation-time, [data-time], time');
-          if(!slotNodes.length) {{
-            // fallback: search nearby siblings
-            slotNodes = (n.parentElement||document).querySelectorAll('.slot, .time-slot, .slot-label, .reservation-time, [data-time], time');
-          }}
-          slotNodes.forEach(function(s){{
-            var v = s.getAttribute('data-time') || s.textContent || '';
-            v = v.replace(/\\s+/g,' ').trim();
-            if(v && slots.indexOf(v)<0) slots.push(v);
-          }});
-          // If no slots at this node, try detecting time-like strings inside text
-          if(!slots.length) {{
-            var m = text.match(/\\b(\\d{{1,2}}:?\\d{{0,2}}\\s?(?:AM|PM|am|pm)?\\s?[-–—]\\s?\\d{{1,2}}:?\\d{{0,2}}\\s?(?:AM|PM|am|pm)?)/g);
-            if(m) slots = m.map(function(x){{return x.trim();}});
-          }}
-          slots.forEach(function(s){{ if(data[cname].indexOf(s)<0) data[cname].push(s); }});
-        }});
-
-        var payload = JSON.stringify({{day: DAY, mapping: data}});
-        fetch('{origin_base}/ingest/availability', {{
-          method: 'POST',
-          headers: {{'Content-Type': 'application/json'}},
-          body: payload,
-          credentials: 'omit'
-        }}).then(function(res) {{
-          if(!res.ok) throw new Error('HTTP '+res.status);
-          return res.json();
-        }}).then(function(resp){{
-          alert('Imported '+ (resp.imported||0) +' slots for '+DAY+' across '+ (resp.courts||0) +' courts.');
-        }}).catch(function(err){{
-          console.error(err);
-          alert('Import failed: '+err.message+' — You can still add slots in Admin page.');
-        }});
-      }} catch(e) {{
-        console.error(e);
-        alert('Import error: '+e.message);
-      }}
-    }})();"""
-    # Minify very lightly (remove line breaks)
-    return js.replace("\n"," ").replace("  "," ")
-
-@app.get("/admin/bookmarklet")
-def admin_bookmarklet():
-    # Build absolute origin for this app (used by the bookmarklet POST)
-    origin = request.url_root.rstrip("/")
-    bm_js = _bookmarklet_js(origin)
-    return render_view(ADMIN_BM_TPL, bookmarklet_js=bm_js)
-
-@app.post("/ingest/availability")
-def ingest_availability():
-    """
-    Receives JSON: { "day": "Saturday"|"Sunday", "mapping": {"Court 1": ["9:00–10:00", ...], ...} }
-    Saves into DB for the given day (replacing existing).
-    """
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        day = (data.get("day") or "").strip()
-        mapping = data.get("mapping") or {}
-        if day not in DAYS:
-            return jsonify(ok=False, error="Invalid day"), 400
-        # Clean mapping keys to our known court labels
-        clean = {}
-        for k, v in mapping.items():
-            if not isinstance(v, list): continue
-            # match incoming name to one of our known labels
-            label = next((L for L in ALL_COURTS if L.lower() in (k or "").lower()), None)
-            if not label: continue
-            # normalize slot strings
-            slots = []
-            for s in v:
-                s = (s or "").strip()
-                if s and s not in slots:
-                    slots.append(s)
-            clean[label] = slots
-        # Insert
-        before = get_availability_times().get(day, {})
-        bulk_upsert_availability(day, clean)
-        after = get_availability_times().get(day, {})
-        imported_slots = sum(len(v) for v in after.values())
-        courts_with_data = sum(1 for v in after.values() if v)
-        return jsonify(ok=True, imported=imported_slots, courts=courts_with_data)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
-
 if __name__ == "__main__":
-    # IMPORTANT: bind to host/port from your platform (Render sets PORT)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

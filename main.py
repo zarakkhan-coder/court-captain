@@ -1,8 +1,9 @@
-# CourtCaptain — votes, names-per-option, 4-player rule, weather, availability with times, booking button
+# CourtCaptain — Votes + Names, 4-player rule, Weather, Manual Availability Editor, Booking Button
+# Drop-in main.py for Render (or any host). No scraping required.
+
 from flask import Flask, request, redirect, url_for, render_template_string, flash, jsonify
 from datetime import datetime, timezone, date
 import os, sqlite3, requests
-from bs4 import BeautifulSoup
 
 APP_NAME = "CourtCaptain"
 PREFERRED_COURTS = ["Court 1", "Court 2", "Court 3", "Court 4"]
@@ -10,15 +11,11 @@ ALL_COURTS = PREFERRED_COURTS + ["Court 5", "Court 6", "Court 7", "Outdoor A", "
 DAYS = ["Saturday", "Sunday"]
 
 # --- Environment (set in Render → Environment) ---
-RESET_PIN  = os.environ.get("RESET_PIN", "1234")
-SECRET_KEY = os.environ.get("SECRET_KEY", "replace-me")
-BOOKING_URL = os.environ.get("BOOKING_URL", "https://wholehealth.walmart.com/")  # customize if you have a direct booking URL
-# Weather coords (Walton Fitness Centre or your outdoor courts)
-LAT = float(os.environ.get("WALTON_LAT", "36.372"))
+RESET_PIN   = os.environ.get("RESET_PIN", "1234")
+SECRET_KEY  = os.environ.get("SECRET_KEY", "replace-me")          # set any long random string
+BOOKING_URL = os.environ.get("BOOKING_URL", "https://wholehealth.walmart.com/")
+LAT = float(os.environ.get("WALTON_LAT", "36.372"))               # optional: exact coords
 LON = float(os.environ.get("WALTON_LON", "-94.208"))
-# Availability fetch (HTML page or endpoint). If auth needed, put cookie/headers here:
-AVAILABILITY_URL = os.environ.get("AVAILABILITY_URL", "https://wholehealth.walmart.com/")
-WALHEALTH_COOKIE = os.environ.get("WALHEALTH_COOKIE", "")  # optional; not displayed in UI
 
 DB_PATH = "data.db"
 
@@ -34,13 +31,21 @@ def db():
 def init_db():
     conn = db()
     c = conn.cursor()
+    # Votes (one row per unique name; re-vote overwrites)
     c.execute("""CREATE TABLE IF NOT EXISTS votes(
         name  TEXT PRIMARY KEY,
         day   TEXT NOT NULL,
         court TEXT NOT NULL,
         ts    TEXT NOT NULL
     )""")
+    # Availability (one row per slot)
+    c.execute("""CREATE TABLE IF NOT EXISTS availability(
+        day   TEXT NOT NULL,   -- 'Saturday' or 'Sunday'
+        court TEXT NOT NULL,   -- e.g., 'Court 1'
+        slot  TEXT NOT NULL    -- e.g., '9:00–10:00'
+    )""")
     conn.commit(); conn.close()
+
 init_db()
 
 # ---------- helpers ----------
@@ -50,19 +55,16 @@ def pref_rank(court):
 def day_rank(day):
     return 0 if day == "Saturday" else 1
 
-def is_outdoor(court:str)->bool:
-    return ("outdoor" in court.lower())
+def is_outdoor(court: str) -> bool:
+    return "outdoor" in court.lower()
 
 def tally_with_names():
     """
-    Returns totals AND voter names per (day, court).
+    Return totals AND voter names per (day, court).
     {
       'total_players': int,
-      'counts': [
-        {'day': 'Saturday', 'court':'Court 1', 'votes': 3, 'names': ['Alice','Ben','Joy']},
-        ...
-      ],
-      'top_choice': {'day':'Saturday','court':'Court 1','votes':3,'names':[...]} or None,
+      'counts': [{'day':..,'court':..,'votes':..,'names':[...]}...],
+      'top_choice': {'day':..,'court':..,'votes':..,'names':[...]} or None,
       'booking_possible': bool
     }
     """
@@ -73,17 +75,15 @@ def tally_with_names():
     unique_players = set()
     buckets = {}  # (day,court) -> {'votes': int, 'names': [str]}
     for r in rows:
-        name = (r["name"] or "").strip()
-        if not name:
+        nm = (r["name"] or "").strip()
+        if not nm:
             continue
-        unique_players.add(name.lower())
+        unique_players.add(nm.lower())
         key = (r["day"], r["court"])
         if key not in buckets:
             buckets[key] = {"votes": 0, "names": []}
-        # If the same person re-votes to the same pair we overwrite at insert time,
-        # so here we just count and list
         buckets[key]["votes"] += 1
-        buckets[key]["names"].append(name)
+        buckets[key]["names"].append(nm)
 
     ranked = sorted(
         buckets.items(),
@@ -92,7 +92,7 @@ def tally_with_names():
     top = None
     if ranked:
         (d, c), info = ranked[0]
-        top = {"day": d, "court": c, "votes": info["votes"], "names": info["names"]}
+        top = {"day": d, "court": c, "votes": info["votes"], "names": sorted(info["names"])}
 
     counts = [{"day": d, "court": c, "votes": info["votes"], "names": sorted(info["names"])}
               for (d, c), info in ranked]
@@ -106,10 +106,9 @@ def tally_with_names():
 
 def fetch_weather_all():
     """
-    Fetch simple daily forecast for next 7 days via Open-Meteo (no key).
-    Returns dict for Sat/Sun if present:
-    {'Saturday': {'tmax': .., 'tmin': .., 'pop': .., 'date': 'YYYY-MM-DD'},
-     'Sunday':   {...}}
+    Simple 7-day forecast via Open-Meteo (no API key).
+    Returns weather for Saturday and Sunday if present:
+    {'Saturday': {'tmax':..,'tmin':..,'pop':..,'date':'YYYY-MM-DD'}, 'Sunday': {...}}
     """
     out = {}
     try:
@@ -134,45 +133,27 @@ def fetch_weather_all():
     except Exception:
         return out  # empty on failure
 
-def fetch_availability_times():
+def get_availability_times():
     """
-    Attempts to fetch live court availability and time slots from AVAILABILITY_URL.
-    Returns dict: {'Court 1': ['9:00-10:00','10:00-11:00'], ...}
-    Implementation:
-      - GET the page (add Cookie header if WALHEALTH_COOKIE set)
-      - Parse HTML with BeautifulSoup and look for court names + time slots.
-    NOTE: structure depends on the page; adjust the CSS selectors below as needed.
+    Manual availability from the local DB (admin-editable).
+    Returns: {'Saturday': {'Court 1':[...], ...}, 'Sunday': {...}}
     """
-    result = {c: [] for c in ALL_COURTS}
-    try:
-        headers = {}
-        if WALHEALTH_COOKIE:
-            headers["Cookie"] = WALHEALTH_COOKIE
-        r = requests.get(AVAILABILITY_URL, headers=headers, timeout=10)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+    result = {d: {c: [] for c in ALL_COURTS} for d in DAYS}
+    conn = db()
+    rows = conn.execute("SELECT day, court, slot FROM availability").fetchall()
+    conn.close()
+    for r in rows:
+        day, court, slot = r["day"], r["court"], r["slot"]
+        if day in result and court in result[day]:
+            if slot not in result[day][court]:
+                result[day][court].append(slot)
+    # Sort slots for nicer display
+    for d in DAYS:
+        for c in ALL_COURTS:
+            result[d][c].sort()
+    return result
 
-        # --- Example parsing logic; tweak selectors to match the site ---
-        # Suppose each court is in an element like: <div class="court" data-name="Court 1"> ... <span class="slot">9:00-10:00</span> ...
-        courts = soup.select(".court")
-        for c in courts:
-            cname = (c.get("data-name") or c.text or "").strip()
-            # Normalize to one of our known labels if possible
-            match = next((label for label in ALL_COURTS if label.lower() in cname.lower()), None)
-            if not match:
-                continue
-            slots = [el.get_text(strip=True) for el in c.select(".slot")]
-            # Deduplicate and sort nicely
-            seen = []
-            for s in slots:
-                if s and s not in seen:
-                    seen.append(s)
-            result[match] = seen
-        return result
-    except Exception:
-        return result  # empty slots if fetch/parse fails
-
-# ---------- templates (no Jinja inheritance — stable everywhere) ----------
+# ---------- templates (no Jinja inheritance — simple & stable) ----------
 BASE = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -202,7 +183,7 @@ input,select{width:100%;padding:12px;border-radius:10px;border:1px solid var(--b
 .btn.danger{background:linear-gradient(135deg,#ef4444,#f87171);border:none}
 .btn.danger:hover{filter:brightness(1.05);transform: translateY(-1px)}
 .table{display:flex;flex-direction:column;gap:10px}
-.row{display:grid;grid-template-columns:1.2fr 1.2fr 100px;gap:12px;background:#0f1627;border:1px solid var(--border);border-radius:12px;padding:12px}
+.row{display:grid;grid-template-columns:1.2fr 1.2fr 1fr;gap:12px;background:#0f1627;border:1px solid var(--border);border-radius:12px;padding:12px}
 .head{background:transparent;border-style:dashed;font-weight:600}
 .badge{background:#14304a;border:1px solid #285b8a;padding:4px 8px;border-radius:999px;font-size:12px;margin-left:6px}
 .kpi{display:flex;gap:10px;flex-wrap:wrap}
@@ -212,7 +193,11 @@ input,select{width:100%;padding:12px;border-radius:10px;border:1px solid var(--b
 @keyframes fadeIn {from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:none}}
 </style></head><body><div class="page">
 <div class="header"><div class="brand"><div class="logo">🏓</div><div class="title">{{ app_name }}</div></div>
-<div class="nav"><a href="{{ url_for('home') }}">Vote</a><a href="{{ url_for('results') }}">Results</a></div></div>
+<div class="nav">
+  <a href="{{ url_for('home') }}">Vote</a>
+  <a href="{{ url_for('results') }}">Results</a>
+  <a href="{{ url_for('admin_availability') }}">Admin</a>
+</div></div>
 {% with messages = get_flashed_messages(with_categories=true) %}{% for cat,msg in messages %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}{% endwith %}
 {{ content|safe }}
 <div class="footer">© {{ app_name }}</div>
@@ -291,7 +276,7 @@ RESULTS = """
 <div class="card">
   <h3 style="margin-top:0">Vote Breakdown (with names)</h3>
   <div class="table">
-    <div class="row head"><div>Day</div><div>Court</div><div>Votes</div></div>
+    <div class="row head"><div>Day</div><div>Court & Voters</div><div>Votes</div></div>
     {% for item in s.counts %}
       <div class="row">
         <div>{{ item.day }}</div>
@@ -310,27 +295,78 @@ RESULTS = """
 </div>
 
 <div class="card">
-  <h3 style="margin-top:0">Pickleball Court Availability (Real-Time)</h3>
-  <div class="table">
-    <div class="row head"><div>Court</div><div>Open Slots</div><div></div></div>
-    {% for c in courts %}
-      <div class="row">
-        <div>{{ c }}</div>
-        <div>{% if avail_times.get(c) and avail_times.get(c)|length > 0 %}{{ avail_times.get(c) | join(', ') }}{% else %}—{% endif %}</div>
-        <div>{% if c in preferred %}Preferred{% endif %}</div>
-      </div>
-    {% endfor %}
-  </div>
+  <h3 style="margin-top:0">Pickleball Court Availability (Manual, Real-Time)</h3>
+  {% for d in days %}
+    <h4>{{ d }}</h4>
+    <div class="table">
+      <div class="row head"><div>Court</div><div>Open Slots</div><div></div></div>
+      {% for c in courts %}
+        <div class="row">
+          <div>{{ c }}</div>
+          <div>{% if avail[d][c] and avail[d][c]|length > 0 %}{{ avail[d][c] | join(', ') }}{% else %}—{% endif %}</div>
+          <div>{% if c in preferred %}Preferred{% endif %}</div>
+        </div>
+      {% endfor %}
+    </div>
+  {% endfor %}
 </div>
 """
 
-RESET = """
+# ----- Admin: Availability Editor -----
+ADMIN_AVAIL_TPL = """
+<div class="glass">
+  <h1 class="heading">Admin: Court Availability</h1>
+  <p class="sub">Add time slots per court and day. Use your PIN below to clear all if needed.</p>
+</div>
+
 <div class="card">
-  <h2 style="margin-top:0">Reset Votes (Admin)</h2>
-  <form method="POST" action="{{ url_for('confirm_reset') }}" class="form">
-    <label><span>Enter PIN</span><input type="password" name="pin" placeholder="PIN" required></label>
-    <button class="btn danger" type="submit">Confirm Reset</button>
-    <a class="btn link" href="{{ url_for('home') }}">Cancel</a>
+  <form method="POST" class="form">
+    <div class="grid">
+      <label><span>Day</span>
+        <select name="day" required>
+          {% for d in days %}<option value="{{ d }}">{{ d }}</option>{% endfor %}
+        </select>
+      </label>
+      <label><span>Court</span>
+        <select name="court" required>
+          {% for c in courts %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+        </select>
+      </label>
+      <label><span>Time slot (e.g., 9:00–10:00)</span>
+        <input name="slot" placeholder="9:00–10:00" required>
+      </label>
+    </div>
+    <button class="btn primary" type="submit">Add Slot</button>
+    <a class="btn link" href="{{ url_for('results') }}">Back to Dashboard</a>
+  </form>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">Current Availability</h3>
+  {% for d in days %}
+    <h4>{{ d }}</h4>
+    <div class="table">
+      <div class="row head"><div>Court</div><div>Slots</div><div></div></div>
+      {% for c in courts %}
+        <div class="row">
+          <div>{{ c }}</div>
+          <div>
+            {% if data[d][c] and data[d][c]|length > 0 %}
+              {{ data[d][c] | join(', ') }}
+            {% else %}—{% endif %}
+          </div>
+          <div>{% if c in preferred %}Preferred{% endif %}</div>
+        </div>
+      {% endfor %}
+    </div>
+  {% endfor %}
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">Clear All Availability</h3>
+  <form method="POST" action="{{ url_for('admin_availability_clear') }}" class="form" onsubmit="return confirm('Clear all slots?')">
+    <label><span>PIN</span><input type="password" name="pin" required placeholder="Enter PIN"></label>
+    <button class="btn danger" type="submit">Clear All</button>
   </form>
 </div>
 """
@@ -346,9 +382,9 @@ def health(): return jsonify(ok=True), 200
 @app.route("/", methods=["GET","POST"])
 def home():
     if request.method == "POST":
-        name = (request.form.get("name") or "").strip()
-        day  = request.form.get("day")
-        court= request.form.get("court")
+        name  = (request.form.get("name") or "").strip()
+        day   = request.form.get("day")
+        court = request.form.get("court")
         if not name or day not in DAYS or court not in ALL_COURTS:
             flash("Please enter your name, a valid day, and a court.", "error")
             return redirect(url_for("home"))
@@ -367,16 +403,21 @@ def home():
 def results():
     s = tally_with_names()
     wx = fetch_weather_all()
-    avail_times = fetch_availability_times()
+    avail = get_availability_times()
     return render_view(
         RESULTS,
         summary=s, preferred=PREFERRED_COURTS, courts=ALL_COURTS,
-        wx=wx, avail_times=avail_times
+        days=DAYS, wx=wx, avail=avail
     )
 
 @app.post("/reset")
 def reset():
-    return render_view(RESET)
+    return render_view("""<div class="card"><h2>Reset Votes (Admin)</h2>
+        <form method="POST" action="{{ url_for('confirm_reset') }}" class="form">
+          <label><span>Enter PIN</span><input type="password" name="pin" placeholder="PIN" required></label>
+          <button class="btn danger" type="submit">Confirm Reset</button>
+          <a class="btn link" href="{{ url_for('home') }}">Cancel</a>
+        </form></div>""")
 
 @app.post("/confirm-reset")
 def confirm_reset():
@@ -389,20 +430,49 @@ def confirm_reset():
 
 @app.post("/book")
 def book_court():
-    """
-    Redirects to your booking site with query parameters, so you can complete the booking.
-    Configure BOOKING_URL in Environment to point to the exact booking page.
-    """
+    """Redirect to booking site with simple query params."""
     day = (request.form.get("day") or "").strip()
     court = (request.form.get("court") or "").strip()
-    # basic guard
     if day not in DAYS or court not in ALL_COURTS:
         flash("Invalid booking selection.", "error")
         return redirect(url_for("results"))
-    # Construct a simple URL with parameters
     sep = "&" if "?" in BOOKING_URL else "?"
     target = f"{BOOKING_URL}{sep}day={day}&court={court}"
     return redirect(target, code=302)
 
+# ----- Admin Availability Editor -----
+@app.get("/admin/availability")
+def admin_availability():
+    data = get_availability_times()
+    return render_view(ADMIN_AVAIL_TPL, days=DAYS, courts=ALL_COURTS, preferred=PREFERRED_COURTS, data=data)
+
+@app.post("/admin/availability")
+def admin_availability_post():
+    day = (request.form.get("day") or "").strip()
+    court = (request.form.get("court") or "").strip()
+    slot = (request.form.get("slot") or "").strip()
+    if day not in DAYS or court not in ALL_COURTS or not slot:
+        flash("Please choose a valid day, court, and slot.", "error")
+        return redirect(url_for("admin_availability"))
+    conn = db()
+    exists = conn.execute("SELECT 1 FROM availability WHERE day=? AND court=? AND slot=?", (day, court, slot)).fetchone()
+    if not exists:
+        conn.execute("INSERT INTO availability(day, court, slot) VALUES(?,?,?)", (day, court, slot))
+        conn.commit()
+    conn.close()
+    flash("Time slot added.", "success")
+    return redirect(url_for("admin_availability"))
+
+@app.post("/admin/availability/clear")
+def admin_availability_clear():
+    pin = request.form.get("pin","")
+    if pin != RESET_PIN:
+        flash("Invalid PIN.", "error")
+        return redirect(url_for("admin_availability"))
+    conn = db(); conn.execute("DELETE FROM availability"); conn.commit(); conn.close()
+    flash("All availability cleared.", "success")
+    return redirect(url_for("admin_availability"))
+
 if __name__ == "__main__":
+    # IMPORTANT: bind to host/port from your platform (Render sets PORT)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
